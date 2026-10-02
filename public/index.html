@@ -210,6 +210,10 @@ function canvasErrors(version, errors) {
   for (const e of errors) add(el("div", "stderr", `canvas v${version}: ${e}`));
 }
 
+function glanceIssues(msg) {
+  for (const issue of (msg.glance && msg.glance.issues) || []) add(el("div", "meta", `glance check, v${msg.version}: ${issue}`));
+}
+
 // ---- canvas frame management ----------------------------------------------
 
 let latest = 0;            // newest canvas version
@@ -289,9 +293,11 @@ window.addEventListener("message", async (e) => {
     toFrame({ kind: "history", events: simpleHistory });
     flushPatches();
     canvasErrors(msg.version, msg.errors);
+    glanceIssues(msg);
     post("/canvas/report", msg);
   } else if (msg.kind === "patched" || msg.kind === "error") {
     canvasErrors(msg.version, msg.errors);
+    glanceIssues(msg);
     post("/canvas/report", msg);
   } else if (msg.kind === "send") {
     const text = String(msg.text || "").trim();

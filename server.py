@@ -44,6 +44,8 @@ else:
 parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 parser.add_argument("--cwd", default=os.getcwd(), help="directory the agent works in")
 parser.add_argument("--port", type=int, default=4477)
+parser.add_argument("--glance-min-font", type=float, default=14, help="smallest allowed canvas text, px")
+parser.add_argument("--glance-max-words", type=int, default=60, help="most visible words on the canvas")
 args = parser.parse_args(own_argv)
 
 ROOT = Path(__file__).parent
@@ -51,13 +53,18 @@ CWD = str(Path(args.cwd).resolve())
 TOKEN = os.environ.get("BRIDGE_TOKEN") or secrets.token_hex(16)
 INDEX_HTML = ROOT / "public" / "index.html"
 CANVAS_RUNTIME = (ROOT / "canvas" / "runtime.js").read_text()
-CANVAS_PROMPT = (ROOT / "canvas" / "prompt.md").read_text()
+GLANCE = {"minFont": args.glance_min_font, "maxWords": args.glance_max_words}
+CANVAS_PROMPT = (
+    (ROOT / "canvas" / "prompt.md").read_text()
+    .replace("{{MIN_FONT}}", f"{GLANCE['minFont']:g}")
+    .replace("{{MAX_WORDS}}", str(GLANCE["maxWords"]))
+)
 
 # ---- canvas guardrails --------------------------------------------------------
 
 MAX_HTML_BYTES = 1_000_000
 MAX_PATCH_BYTES = 500_000
-LARGE_UPDATE_BYTES = 8_000  # beyond this, suggest a new layout instead
+LARGE_UPDATE_BYTES = 1_500  # beyond this, suggest a new layout instead
 CANVAS_SEND_LIMIT = (3, 10.0)  # at most 3 canvas messages per 10 seconds
 CANVAS_SEND_MAX_CHARS = 4000
 
@@ -197,6 +204,7 @@ class Agent:
         self.canvas: list[dict] = []  # versions: {"html": str, "patches": [ops, ...]}
         self.reports: dict[tuple, dict] = {}  # (version, "ready"|patch index) -> report
         self.canvas_errors: deque = deque(maxlen=20)
+        self.glance: dict | None = None  # latest glance check from the browser
         self.canvas_sends: deque = deque(maxlen=20)
         self.client_info: dict = {}
         self.slots: dict[int, list[str]] = {}  # version -> slot names reported by the browser
@@ -368,6 +376,8 @@ class Agent:
 
     def add_report(self, report: dict) -> None:
         version = report.get("version")
+        if isinstance(report.get("glance"), dict):
+            self.glance = {"version": version, **report["glance"]}
         if isinstance(report.get("slots"), list):
             self.slots[version] = [str(x) for x in report["slots"]]
             self.renderers[version] = [str(x) for x in report.get("renderers") or []]
@@ -390,8 +400,23 @@ class Agent:
             return "The browser didn't confirm within the timeout (the tab may be in the background)."
         errors = report.get("errors") or []
         if not errors:
-            return "Browser applied it with no JS errors."
-        return "Browser reported JS errors:\n" + "\n".join(f"- {e}" for e in errors)
+            text = "Browser applied it with no JS errors."
+        else:
+            text = "Browser reported JS errors:\n" + "\n".join(f"- {e}" for e in errors)
+        return text + self._describe_glance(report.get("glance"))
+
+    def _describe_glance(self, glance: dict | None) -> str:
+        if not glance:
+            return ""
+        size = f"{glance.get('width')}x{glance.get('height')}"
+        issues = glance.get("issues") or []
+        if not issues:
+            return f"\nGlance check passed ({glance.get('words')} words at {size})."
+        return (
+            f"\nGLANCE CHECK FAILED at {size}. The user can't read this at a glance:\n"
+            + "\n".join(f"- {i}" for i in issues)
+            + "\nFix this before doing anything else: cut content, enlarge text, or split it into steps or tabs."
+        )
 
     def _viewport(self) -> str:
         info = self.client_info
@@ -470,6 +495,8 @@ class Agent:
             "patches_on_current_version": len(self.canvas[-1]["patches"]) if self.canvas else 0,
             "connected_browsers": self.browsers,
             "viewport": self.client_info or None,
+            "glance_limits": GLANCE,
+            "last_glance_check": self.glance,
             "recent_js_errors": list(self.canvas_errors),
             "recent_canvas_messages": [s["text"] for s in self.canvas_sends],
         }
@@ -479,7 +506,12 @@ class Agent:
         """Agent HTML for a version, with the bridge runtime and patch replay injected."""
         entry = self.canvas[version - 1]
         # lineOffset lets the runtime report line numbers that match the agent's own HTML.
-        boot = {"version": version, "patches": entry["patches"], "lineOffset": CANVAS_RUNTIME.count("\n") + 1}
+        boot = {
+            "version": version,
+            "patches": entry["patches"],
+            "lineOffset": CANVAS_RUNTIME.count("\n") + 1,
+            "glance": GLANCE,
+        }
         # < keeps "</script>" inside patch html from closing the boot script.
         boot_json = json.dumps(boot).replace("<", "\\u003c")
         head = f"<script>window.__BRIDGE_BOOT={boot_json};\n{CANVAS_RUNTIME}</script>"

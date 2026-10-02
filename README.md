@@ -26,6 +26,16 @@ python3 server.py --cwd ~/code/some-repo            # then open the printed URL
 python3 server.py --cwd . -- --permission-mode acceptEdits --model sonnet
 ```
 
+The canvas is designed as a **glance display**, e.g. a small panel at the edge of AR
+glasses. After every render and update, the page checks itself: text cut off or
+outside the viewport (including text hidden by `overflow: hidden`), text below
+the minimum font size, and visible words over budget. Failures come back to the
+agent as `GLANCE CHECK FAILED`. Tune the budget to your display:
+
+```bash
+python3 server.py --glance-min-font 16 --glance-max-words 40
+```
+
 Anything after `--` is passed through to `claude`.
 
 - **Auth:** binds to `127.0.0.1` only. The printed URL carries a random token,

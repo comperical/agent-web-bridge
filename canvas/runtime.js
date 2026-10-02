@@ -83,8 +83,21 @@
 
   // Resolution order: renderer for the exact name, element with that data-slot,
   // then a renderer for the nearest dotted prefix ("plan" handles "plan.3").
+  // Briefly mark updated slots so a change catches the eye in peripheral vision.
+  // Pages can restyle [data-changed]; the default has zero specificity.
+  function markChanged(name) {
+    const el = slotElement(name) || slotElement(name.split(".")[0]);
+    if (!el) return;
+    el.removeAttribute("data-changed");
+    void el.offsetWidth; // restart the animation
+    el.setAttribute("data-changed", "");
+    clearTimeout(el.__bridgeChanged);
+    el.__bridgeChanged = setTimeout(() => el.removeAttribute("data-changed"), 1500);
+  }
+
   function applyUpdate(values) {
     for (const [name, value] of Object.entries(values || {})) {
+      markChanged(name);
       try {
         const exact = renderers.get(name);
         if (exact) { exact(value, { slot: name, key: "", el: slotElement(name) }); continue; }
@@ -104,6 +117,63 @@
     }
   }
 
+  // ---- glance check: is the page readable at a glance on a small display? ----
+
+  function intersect(a, b) {
+    const left = Math.max(a.left, b.left), top = Math.max(a.top, b.top);
+    const right = Math.min(a.right, b.right), bottom = Math.min(a.bottom, b.bottom);
+    return { left, top, right, bottom, area: Math.max(0, right - left) * Math.max(0, bottom - top) };
+  }
+
+  // The part of a rect not clipped by the viewport or by any overflow-clipping ancestor
+  // (so `overflow: hidden` can't hide content from the check).
+  function visibleArea(rect, el, horizontalOk) {
+    let clip = { left: horizontalOk ? -Infinity : 0, top: 0, right: horizontalOk ? Infinity : innerWidth, bottom: innerHeight };
+    for (let a = el; a && a !== document.documentElement; a = a.parentElement) {
+      const cs = getComputedStyle(a);
+      if (cs.overflowX !== "visible" || cs.overflowY !== "visible") {
+        const r = a.getBoundingClientRect();
+        clip = intersect(clip, horizontalOk ? { left: -Infinity, right: Infinity, top: r.top, bottom: r.bottom } : r);
+      }
+    }
+    return intersect(rect, clip).area;
+  }
+
+  const sample = (text) => JSON.stringify(text.length > 40 ? text.slice(0, 40) + "…" : text);
+
+  function glanceCheck() {
+    const W = innerWidth, H = innerHeight;
+    if (!W || !H) return null; // hidden frame; nothing to measure
+    const { minFont, maxWords } = boot.glance;
+    let words = 0;
+    const cut = [], small = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let node; (node = walker.nextNode()); ) {
+      const text = node.textContent.trim();
+      const el = node.parentElement;
+      if (!text || !el || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(el.tagName)) continue;
+      if (el.checkVisibility && !el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) continue;
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const rect = range.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (!area) continue;
+      const cs = getComputedStyle(el);
+      const shown = visibleArea(rect, el, cs.textOverflow === "ellipsis") / area;
+      if (shown < 0.9) cut.push(text);
+      if (shown > 0) {
+        words += text.split(/\s+/).length;
+        const size = parseFloat(cs.fontSize);
+        if (size < minFont) small.push(`${sample(text)} at ${size}px`);
+      }
+    }
+    const issues = [];
+    if (cut.length) issues.push(`${cut.length} text run(s) are cut off or outside the ${W}x${H} viewport, e.g. ${cut.slice(0, 3).map(sample).join(", ")}`);
+    if (small.length) issues.push(`${small.length} text run(s) are smaller than ${minFont}px, e.g. ${small.slice(0, 3).join(", ")}`);
+    if (words > maxWords) issues.push(`${words} visible words; the glance budget is ${maxWords}`);
+    return { width: W, height: H, words, issues };
+  }
+
   // ---- automatic regions, fed by session events at no cost to the agent ----
 
   function toolLabel(ev) {
@@ -121,7 +191,8 @@
       }
     }
     if ((ev.type === "tool" && !isCanvasTool) || ev.type === "text") {
-      const line = ev.type === "tool" ? toolLabel(ev) : ev.text.split("\n").find((l) => l.trim()) || "";
+      const firstLine = ev.type === "text" ? ev.text.split("\n").find((l) => l.trim()) || "" : "";
+      const line = ev.type === "tool" ? toolLabel(ev) : firstLine.replace(/[*_`#>]+/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim();
       for (const el of document.querySelectorAll('[data-auto="activity"]')) el.textContent = line;
     }
     if (ev.type === "tool" && !isCanvasTool) {
@@ -193,7 +264,10 @@
     const msg = e.data || {};
     if (msg.kind === "patch") {
       const errors = applyPatch(msg.ops);
-      post({ kind: "patched", index: msg.index, errors, slots: listSlots(), renderers: [...renderers.keys()] });
+      // Let custom renderers that defer work (e.g. requestAnimationFrame) finish before measuring.
+      setTimeout(() => post({
+        kind: "patched", index: msg.index, errors, slots: listSlots(), renderers: [...renderers.keys()], glance: glanceCheck(),
+      }), 60);
     } else if (msg.kind === "event" || msg.kind === "history") {
       const evs = msg.kind === "event" ? [msg.event] : msg.events;
       for (const ev of evs) {
@@ -208,11 +282,15 @@
   });
 
   document.addEventListener("DOMContentLoaded", () => {
+    const flash = document.createElement("style");
+    flash.textContent = ":where([data-changed]) { animation: bridge-changed 1.5s ease-out; }" +
+      "@keyframes bridge-changed { from { outline: 3px solid #fbbf24; outline-offset: 2px; } to { outline: 3px solid transparent; outline-offset: 2px; } }";
+    document.head.prepend(flash);
     // Replay patches made to this version before the frame loaded.
     for (const ops of boot.patches) startup.push(...applyPatch(ops));
     // Give the page's own scripts a moment to throw before declaring it loaded.
     setTimeout(() => {
-      post({ kind: "ready", applied: boot.patches.length, errors: startup, slots: listSlots(), renderers: [...renderers.keys()] });
+      post({ kind: "ready", applied: boot.patches.length, errors: startup, slots: listSlots(), renderers: [...renderers.keys()], glance: glanceCheck() });
       startup = null;
     }, 300);
   });
