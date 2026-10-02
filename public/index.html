@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Host policy: no remote images (blocks exfiltration via markdown in the transcript). -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Agent Web Bridge</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1f1e1c; --muted: #6f6b66;
+    --border: #e1ddd6; --accent: #c2410c; --user: #f1ede6; --code: #f4f2ee;
+    --ok: #15803d; --err: #b91c1c; --strip: #1f1e1c; --strip-text: #f3f1ed; --strip-muted: #a8a29a;
+    --strip-field: #2c2a27;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161514; --panel: #201f1d; --text: #ece9e4; --muted: #9a958e;
+      --border: #3a3835; --accent: #f97316; --user: #2d2b28; --code: #2a2926;
+      --ok: #4ade80; --err: #f87171; --strip: #0c0b0a; --strip-text: #ece9e4; --strip-muted: #8a857e;
+      --strip-field: #1d1c1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  button { font: inherit; cursor: pointer; }
+
+  /* ---- canvas stage (agent-owned content lives in the iframe) ---- */
+  #stage { flex: 1; position: relative; min-height: 0; }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: var(--bg); }
+  #empty {
+    position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
+    color: var(--muted); padding: 24px;
+  }
+  #empty h2 { color: var(--text); font-weight: 600; margin: 0 0 6px; font-size: 22px; }
+  #empty p { margin: 0; max-width: 440px; }
+
+  /* ---- trusted control strip ---- */
+  #strip {
+    background: var(--strip); color: var(--strip-text);
+    padding: 8px 12px; display: grid; gap: 6px;
+    border-top: 3px solid var(--accent);
+  }
+  .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .badge { font: 600 11px/1 ui-monospace, Menlo, monospace; letter-spacing: .04em; text-transform: uppercase; color: var(--strip-muted); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--strip-muted); flex: none; }
+  .dot.busy { background: var(--accent); animation: pulse 1s infinite alternate; }
+  .dot.idle { background: var(--ok); }
+  @keyframes pulse { to { opacity: .3; } }
+  #ticker {
+    flex: 1; min-width: 0; border: 0; background: none; color: var(--strip-muted); text-align: left; padding: 0;
+    font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #ticker:hover { color: var(--strip-text); }
+  #notice { font-size: 12px; color: #fbbf24; white-space: nowrap; }
+  .chip {
+    border: 1px solid #ffffff22; background: var(--strip-field); color: var(--strip-text);
+    border-radius: 6px; padding: 3px 8px; font-size: 12px; white-space: nowrap;
+  }
+  .chip:disabled { opacity: .35; cursor: default; }
+  .chip.on { border-color: var(--accent); color: var(--accent); }
+  #versions { display: none; gap: 4px; align-items: center; }
+  #versions.show { display: flex; }
+  #vlabel { font: 12px ui-monospace, Menlo, monospace; color: var(--strip-muted); min-width: 52px; text-align: center; }
+  #errBadge { display: none; color: var(--err); border-color: var(--err); }
+  #errBadge.show { display: inline-block; }
+
+  form { display: flex; gap: 8px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; min-height: 40px; max-height: 200px; padding: 9px 12px;
+    border: 1px solid #ffffff1f; border-radius: 8px; background: var(--strip-field); color: var(--strip-text);
+    font: inherit;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .btn { border: 0; border-radius: 8px; padding: 9px 16px; font-weight: 600; }
+  #send { background: var(--accent); color: #fff; }
+  #stop { background: var(--strip-field); color: var(--strip-text); display: none; }
+  body.busy #stop { display: inline-block; }
+
+  /* ---- transcript drawer ---- */
+  #drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100vw);
+    background: var(--panel); border-left: 1px solid var(--border); box-shadow: -12px 0 32px #0003;
+    transform: translateX(105%); transition: transform .2s ease; display: flex; flex-direction: column; z-index: 10;
+  }
+  body.drawer #drawer { transform: none; }
+  #drawer header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  #drawer header h2 { font-size: 14px; margin: 0; flex: 1; }
+  #drawer header .cwd { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+  #closeDrawer { border: 0; background: none; color: var(--muted); font-size: 18px; }
+  #scroller { flex: 1; overflow-y: auto; }
+  #log { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+
+  .user { align-self: flex-end; background: var(--user); padding: 8px 12px; border-radius: 10px; max-width: 85%; white-space: pre-wrap; }
+  .user.canvas { border: 1px dashed var(--accent); }
+  .user .via { display: block; font-size: 11px; color: var(--accent); }
+  .text > :first-child { margin-top: 0; } .text > :last-child { margin-bottom: 0; }
+  .text pre, .tool pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  .text code { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .stderr { color: var(--err); font: 12px ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+
+  details.tool { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+  details.tool summary { cursor: pointer; padding: 6px 10px; font-size: 13px; display: flex; gap: 8px; align-items: baseline; list-style: none; }
+  details.tool summary::-webkit-details-marker { display: none; }
+  details.tool summary .name { font-weight: 600; white-space: nowrap; }
+  details.tool summary .arg { color: var(--muted); font-family: ui-monospace, Menlo, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+  details.tool summary .state { font-size: 12px; color: var(--muted); }
+  details.tool summary .state.ok { color: var(--ok); }
+  details.tool summary .state.err { color: var(--err); }
+  details.tool .body { padding: 0 10px 8px; }
+  details.tool pre { margin: 6px 0 0; max-height: 320px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  details.thinking summary { color: var(--muted); font-style: italic; }
+
+  @media (max-width: 640px) {
+    #versions .chip.nav, #vlabel { display: none; }
+  }
+</style>
+</head>
+<body>
+<main id="stage">
+  <div id="empty">
+    <div>
+      <h2>Blank canvas</h2>
+      <p>Tell the agent what you're working on. It designs this page as it goes, and you steer with the bar below.</p>
+    </div>
+  </div>
+  <iframe id="canvas" title="Agent canvas" hidden
+          sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer" allow=""></iframe>
+</main>
+
+<footer id="strip">
+  <div class="row">
+    <span class="badge" title="This bar is the trusted host. The agent can't draw here."><span class="dot" id="dot"></span>bridge</span>
+    <button id="ticker" type="button" title="Open transcript">connecting…</button>
+    <span id="notice"></span>
+    <button class="chip" id="errBadge" type="button" title="Canvas JS errors (open transcript)"></button>
+    <span id="versions">
+      <button class="chip nav" id="prev" type="button" title="Previous canvas version">◀</button>
+      <span id="vlabel"></span>
+      <button class="chip nav" id="next" type="button" title="Next canvas version">▶</button>
+      <button class="chip" id="live" type="button" title="Follow the latest canvas">live</button>
+    </span>
+    <button class="chip" id="openDrawer" type="button">transcript</button>
+  </div>
+  <form id="form">
+    <textarea id="input" rows="1" placeholder="Message the agent. Enter sends, Shift+Enter adds a new line." autofocus></textarea>
+    <button type="button" class="btn" id="stop">Stop</button>
+    <button type="submit" class="btn" id="send">Send</button>
+  </form>
+</footer>
+
+<aside id="drawer" aria-label="Transcript">
+  <header><h2>Transcript</h2><span class="cwd" id="cwd"></span><button id="closeDrawer" type="button" title="Close (Esc)">✕</button></header>
+  <div id="scroller"><div id="log"></div></div>
+</aside>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = $("log"), scroller = $("scroller"), input = $("input"), iframe = $("canvas");
+
+function md(text) {
+  if (window.marked && window.DOMPurify) return DOMPurify.sanitize(marked.parse(text));
+  const d = document.createElement("div"); d.textContent = text; return `<p style="white-space:pre-wrap">${d.innerHTML}</p>`;
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function add(node) {
+  const atBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+  log.appendChild(node);
+  if (atBottom) scroller.scrollTop = scroller.scrollHeight;
+}
+async function post(path, body) {
+  return fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+}
+
+// ---- strip ----------------------------------------------------------------
+
+function setStatus(busy) {
+  document.body.classList.toggle("busy", busy);
+  $("dot").className = "dot " + (busy ? "busy" : "idle");
+}
+function ticker(text) {
+  const plain = text.replace(/[*_`#>]+/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1");
+  $("ticker").textContent = plain.replace(/\s+/g, " ").trim() || "…";
+}
+let noticeTimer;
+function notice(text) {
+  $("notice").textContent = text;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { $("notice").textContent = ""; }, 6000);
+}
+let errorCount = 0;
+function canvasErrors(version, errors) {
+  if (!errors || !errors.length) return;
+  errorCount += errors.length;
+  $("errBadge").textContent = `⚠ ${errorCount}`;
+  $("errBadge").classList.add("show");
+  for (const e of errors) add(el("div", "stderr", `canvas v${version}: ${e}`));
+}
+
+// ---- canvas frame management ----------------------------------------------
+
+let latest = 0;            // newest canvas version
+let pinned = null;         // version the user is browsing, or null to follow latest
+let frame = { version: 0, ready: false, applied: 0, loads: 0, retries: 0 };
+const patches = {};        // version -> [ops, ...] in index order
+const simpleHistory = [];  // simplified events for bridge.onEvent
+let loadTimer;
+
+function shownVersion() { return pinned ?? latest; }
+
+function loadFrame(version, isRetry) {
+  frame = { version, ready: false, applied: 0, loads: 0, retries: isRetry ? frame.retries + 1 : 0 };
+  $("empty").hidden = true;
+  iframe.hidden = false;
+  iframe.src = `/canvas/frame?v=${version}`;
+  updateVersions();
+}
+
+function scheduleLoad() {
+  // Replaying a long session fires many renders at once; load only the last one.
+  clearTimeout(loadTimer);
+  loadTimer = setTimeout(() => { if (frame.version !== shownVersion()) loadFrame(shownVersion()); }, 40);
+}
+
+// Any load after the first means the canvas navigated itself. The host's
+// frame-src policy blocks other origins; restore the page and tell the agent.
+iframe.addEventListener("load", () => {
+  if (frame.version === 0 || ++frame.loads === 1) return;
+  const error = "Canvas tried to navigate away from its page. Navigation is blocked; the page was reloaded.";
+  canvasErrors(frame.version, [error]);
+  post("/canvas/report", { kind: "error", version: frame.version, errors: [error] });
+  if (frame.retries < 3) loadFrame(frame.version, true);
+  else {
+    notice(`Canvas v${frame.version} keeps navigating away; stopped loading it`);
+    frame.version = 0; // detaches the detector until the next loadFrame
+    iframe.src = "about:blank";
+  }
+});
+
+function toFrame(msg) { iframe.contentWindow && iframe.contentWindow.postMessage(msg, "*"); }
+
+function flushPatches() {
+  if (!frame.ready) return;
+  const list = patches[frame.version] || [];
+  while (frame.applied < list.length) {
+    toFrame({ kind: "patch", index: frame.applied, ops: list[frame.applied] });
+    frame.applied++;
+  }
+}
+
+function updateVersions() {
+  $("versions").classList.toggle("show", latest > 0);
+  const v = shownVersion();
+  $("vlabel").textContent = `v${v}/${latest}`;
+  $("prev").disabled = v <= 1;
+  $("next").disabled = v >= latest;
+  $("live").classList.toggle("on", pinned === null);
+}
+
+function browse(v) {
+  pinned = v >= latest ? null : Math.max(1, v);
+  updateVersions();
+  if (frame.version !== shownVersion()) loadFrame(shownVersion());
+}
+$("prev").onclick = () => browse(shownVersion() - 1);
+$("next").onclick = () => browse(shownVersion() + 1);
+$("live").onclick = () => browse(latest);
+
+window.addEventListener("message", async (e) => {
+  if (e.source !== iframe.contentWindow) return; // only our canvas frame
+  const msg = e.data || {};
+  if (msg.version !== frame.version) return;
+  if (msg.kind === "ready") {
+    frame.ready = true;
+    frame.applied = msg.applied;
+    toFrame({ kind: "history", events: simpleHistory });
+    flushPatches();
+    canvasErrors(msg.version, msg.errors);
+    post("/canvas/report", msg);
+  } else if (msg.kind === "patched" || msg.kind === "error") {
+    canvasErrors(msg.version, msg.errors);
+    post("/canvas/report", msg);
+  } else if (msg.kind === "send") {
+    const text = String(msg.text || "").trim();
+    if (!text) return;
+    const r = await post("/send", { text, source: "canvas" });
+    if (r.status === 429) notice("Canvas message blocked: too many in a row");
+    else if (!r.ok) notice(`Canvas message failed (${r.status})`);
+  }
+});
+
+let clientTimer;
+function reportClient() {
+  clearTimeout(clientTimer);
+  clientTimer = setTimeout(() => post("/client", {
+    width: $("stage").clientWidth, height: $("stage").clientHeight,
+    scheme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+  }), 300);
+}
+window.addEventListener("resize", reportClient);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", reportClient);
+reportClient();
+
+// ---- events for the canvas (bridge.onEvent) --------------------------------
+
+function toCanvas(ev) {
+  simpleHistory.push(ev);
+  if (simpleHistory.length > 500) simpleHistory.shift();
+  if (frame.ready) toFrame({ kind: "event", event: ev });
+}
+
+function resultText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map(c => c.type === "text" ? c.text : `[${c.type}]`).join("\n");
+  return JSON.stringify(content, null, 2);
+}
+
+// ---- transcript ------------------------------------------------------------
+
+const tools = new Map(); // tool_use_id -> <details>
+
+function prettyToolName(name) { return name.startsWith("mcp__canvas__") ? "canvas." + name.slice(13) : name; }
+function toolArg(name, input) {
+  if (name === "mcp__canvas__render") return `${(input.html || "").length.toLocaleString()} chars of HTML`;
+  if (name === "mcp__canvas__update") return Object.keys(input.values || {}).join(", ");
+  if (name === "mcp__canvas__patch") return (input.ops || []).map(o => `${o.action} ${o.selector}`).join(", ");
+  return input.command ?? input.file_path ?? input.pattern ?? input.url ?? input.query
+    ?? input.description ?? input.prompt ?? input.js ?? "";
+}
+
+function renderToolUse(block) {
+  const d = el("details", "tool");
+  const s = el("summary");
+  const arg = String(toolArg(block.name, block.input || {}));
+  s.append(el("span", "name", prettyToolName(block.name)), el("span", "arg", arg));
+  const state = el("span", "state", "running…");
+  s.append(state);
+  const body = el("div", "body");
+  body.append(el("pre", null, JSON.stringify(block.input, null, 2)));
+  d.append(s, body);
+  d._state = state; d._body = body;
+  tools.set(block.id, d);
+  add(d);
+  ticker(`→ ${prettyToolName(block.name)} ${arg}`);
+}
+
+function renderToolResult(block) {
+  const d = tools.get(block.tool_use_id);
+  const text = resultText(block.content);
+  if (!d) { add(el("pre", "meta", text)); return; }
+  if (d._state.textContent === "denied") { d._body.append(el("pre", null, text)); return; }
+  d._state.textContent = block.is_error ? "error" : "done";
+  d._state.className = "state " + (block.is_error ? "err" : "ok");
+  d._body.append(el("pre", null, text || "(no output)"));
+  if (block.is_error) d.open = true;
+}
+
+function handle(ev) {
+  switch (ev.type) {
+    case "bridge":
+      if (ev.subtype === "hello") { $("cwd").textContent = ev.cwd; setStatus(ev.busy); if (!latest) ticker("ready"); }
+      else if (ev.subtype === "status") { setStatus(ev.busy); toCanvas({ type: "status", busy: ev.busy }); }
+      else if (ev.subtype === "user_input") {
+        const fromCanvas = ev.source === "canvas";
+        const node = el("div", "user" + (fromCanvas ? " canvas" : ""));
+        if (fromCanvas) node.append(el("span", "via", "via canvas"));
+        node.append(document.createTextNode(ev.text));
+        add(node);
+        toCanvas({ type: "user", text: ev.text, source: ev.source || "user" });
+      }
+      else if (ev.subtype === "canvas_render") {
+        latest = ev.version;
+        updateVersions();
+        if (pinned === null) scheduleLoad();
+      }
+      else if (ev.subtype === "canvas_patch") {
+        (patches[ev.version] ||= [])[ev.index] = ev.ops;
+        if (frame.version === ev.version) flushPatches();
+      }
+      else if (ev.subtype === "stderr" || ev.subtype === "stdout") add(el("div", "stderr", ev.text));
+      else if (ev.subtype === "exit") add(el("div", "meta", `agent process exited (code ${ev.code}). The next message resumes the session.`));
+      break;
+    case "system":
+      if (ev.subtype === "init") add(el("div", "meta", `session ${ev.session_id.slice(0, 8)} · ${ev.model} · ${ev.permissionMode ?? ""}`));
+      else if (ev.subtype === "permission_denied") {
+        const d = tools.get(ev.tool_use_id);
+        if (d) { d._state.textContent = "denied"; d._state.className = "state err"; }
+        const msg = `${ev.tool_name} denied: ${ev.decision_reason || ev.message}`;
+        add(el("div", "stderr", msg + " (headless mode can't prompt; see README)"));
+        notice(msg);
+      }
+      break;
+    case "assistant":
+      for (const b of ev.message.content) {
+        if (b.type === "text" && b.text.trim()) {
+          const t = el("div", "text"); t.innerHTML = md(b.text); add(t);
+          ticker(b.text);
+          toCanvas({ type: "text", text: b.text });
+        }
+        else if (b.type === "tool_use") {
+          renderToolUse(b);
+          toCanvas({ type: "tool", id: b.id, name: b.name, input: b.input });
+        }
+        else if (b.type === "thinking" && b.thinking) {
+          const d = el("details", "tool thinking"); d.append(el("summary", null, "thinking"));
+          const body = el("div", "body"); body.append(el("pre", null, b.thinking)); d.append(body); add(d);
+        }
+      }
+      break;
+    case "user":
+      if (Array.isArray(ev.message.content))
+        for (const b of ev.message.content) {
+          if (b.type === "tool_result") {
+            renderToolResult(b);
+            toCanvas({ type: "tool_result", id: b.tool_use_id, ok: !b.is_error, text: resultText(b.content).slice(0, 4000) });
+          }
+          else if (b.type === "text") add(el("div", "meta", b.text)); // e.g. "[Request interrupted by user]"
+        }
+      break;
+    case "result": {
+      const secs = ev.duration_ms / 1000;
+      const cost = ev.total_cost_usd != null ? ` · $${ev.total_cost_usd.toFixed(4)}` : "";
+      add(el("div", "meta", `${ev.is_error ? "⚠ " + ev.subtype + " · " : ""}${ev.num_turns} turns · ${secs.toFixed(1)}s${cost}`));
+      toCanvas({ type: "result", ok: !ev.is_error, turns: ev.num_turns, seconds: secs, cost: ev.total_cost_usd });
+      break;
+    }
+  }
+}
+
+const source = new EventSource("/events");
+source.onmessage = (m) => handle(JSON.parse(m.data));
+source.onerror = () => ticker("reconnecting…");
+
+// ---- input -----------------------------------------------------------------
+
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = ""; input.style.height = "";
+  const r = await post("/send", { text });
+  if (!r.ok) notice(`Send failed (${r.status})`);
+});
+$("stop").onclick = () => post("/interrupt");
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
+});
+input.addEventListener("input", () => { input.style.height = ""; input.style.height = input.scrollHeight + "px"; });
+
+const toggleDrawer = (open) => document.body.classList.toggle("drawer", open);
+$("openDrawer").onclick = () => toggleDrawer(!document.body.classList.contains("drawer"));
+$("ticker").onclick = () => toggleDrawer(true);
+$("errBadge").onclick = () => toggleDrawer(true);
+$("closeDrawer").onclick = () => toggleDrawer(false);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") toggleDrawer(false); });
+</script>
+</body>
+</html>
