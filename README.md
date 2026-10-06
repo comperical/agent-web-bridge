@@ -38,6 +38,16 @@ python3 server.py --glance-min-font 16 --glance-max-words 40
 
 Anything after `--` is passed through to `claude`.
 
+To run it from your own script, import it. Importing has no side effects:
+
+```python
+from agent import Agent
+from server import create_app, serve
+
+agent = Agent("~/code/some-repo", ["--model", "sonnet"], port=4477)
+serve(agent)               # blocks; or create_app(agent) for a Flask app of your own
+```
+
 - **Auth:** binds to `127.0.0.1` only. The printed URL carries a random token,
   which is new on every start. Open it once and a cookie keeps you signed in. Set
   `BRIDGE_TOKEN=...` for a token that stays the same across restarts. Treat the URL like a shell login.
